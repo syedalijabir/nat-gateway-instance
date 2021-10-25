@@ -1,0 +1,228 @@
+---
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+
+Outputs:
+  AllowNatAccessSecurityGroup:
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-AllowNatAccessSecurityGroup
+    Value:
+      Ref: AllowNatAccessSecurityGroup
+
+
+Parameters:
+  VpcId:
+    Description: VpcId Id
+    Type: String
+
+  VpcCidr:
+    Description: Vpc CIDR
+    Type: String
+
+  PrivateSubnetId:
+    Description: ID of private subnet
+    Type: String
+
+  PublicSubnetId:
+    Description: ID of public subnet
+    Type: String
+
+  InternetGatewayId:
+    Description: ID of Internet Gateway
+    Type: String
+
+  AmazonLinux2AmiId:
+    Description: AMI ID for NAT instane
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: VpcId
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${AWS::StackName}-eip
+
+  NatInstanceRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId:
+        Ref: NatInstance
+      RouteTableId:
+        Ref: RouteTablePrivate
+
+  RouteTableAssociationPrivate:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: RouteTablePrivate
+      SubnetId:
+        Ref: PrivateSubnetId
+
+  RouteTableAssociationPublic:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: RouteTablePublic
+      SubnetId:
+        Ref: PublicSubnetId
+
+  RouteTablePrivate:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: rt-private-${AWS::StackName}
+      VpcId:
+        Ref: VpcId
+
+  RouteTablePublic:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: rt-public-${AWS::StackName}
+      VpcId:
+        Ref: VpcId
+
+  RouteTablePublicInternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGatewayId
+      RouteTableId:
+        Ref: RouteTablePublic
+
+  NatGatewayEip:
+    Type: AWS::EC2::EIPAssociation
+    DependsOn: NatInstance
+    Properties:
+      EIP:
+        Ref: ElasticIp
+      InstanceId:
+        Ref: NatInstance
+
+  NatInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - Ref: NatInstanceRole
+
+  NatInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  NatInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: NatInstanceLaunchTemplate
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId:
+          Ref: NatInstanceLaunchTemplate
+        Version:
+          Fn::GetAtt:
+          - NatInstanceLaunchTemplate
+          - LatestVersionNumber
+      SourceDestCheck: false    # Required for NAT instance
+      SubnetId:
+        Ref: PublicSubnetId     # Spawn NAT instance in public subnet
+      Tags:
+      - Key: Name
+        Value: NAT-instance
+
+  NatInstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+    - NatInstanceProfile
+    - NatInstanceSecurityGroup
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Name:
+            Ref: NatInstanceProfile
+        ImageId:
+          Ref: AmazonLinux2AmiId
+        InstanceInitiatedShutdownBehavior: stop
+        InstanceType: t2.micro  # Keeping it freetier
+        SecurityGroupIds:
+        - Ref: NatInstanceSecurityGroup
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              set -x
+
+              sudo yum update -y
+              # Install SSM agent for SSH access
+              sudo yum install -y https://s3.${AWS::Region}.amazonaws.com/amazon-ssm-${AWS::Region}/latest/linux_amd64/amazon-ssm-agent.rpm
+              if [[ "$(systemctl is-active amazon-ssm-agent.service)" == "inactive" ]]; then
+                systemctl start amazon-ssm-agent.service
+              fi
+
+              # Configure NAT rules
+              sudo echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+              sudo sysctl -p
+
+              # NAT
+              sudo iptables -t nat -A POSTROUTING -o eth0 -s ${VpcCidr} -j MASQUERADE
+
+              # Open 443 for input
+              sudo iptables -A INPUT -p tcp --dport 443 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+              sudo iptables -A OUTPUT -p tcp --sport 443 -m conntrack --ctstate ESTABLISHED -j ACCEPT
+
+              echo done.
+      LaunchTemplateName:
+        Fn::Sub: ${AWS::StackName}-launch-template
+
+  NatInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: AllowNatAccessSecurityGroup
+    Description: Security group for NAT Instance
+    Properties:
+      GroupDescription:
+        Fn::Sub: ${AWS::StackName}-NatInstanceSecurityGroup
+      SecurityGroupIngress:
+      - Description: Allow all traffic from private subnet
+        IpProtocol: -1
+        SourceSecurityGroupId:
+          Ref: AllowNatAccessSecurityGroup
+      Tags:
+      - Key: Name
+        Value: sg-nat-instance
+      VpcId:
+        Ref: VpcId
+
+  AllowNatAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Description: Security group for private instances to access public internet through NAT
+    Properties:
+      GroupDescription:
+        Fn::Sub: ${AWS::StackName}-AllowNatAccessSecurityGroup
+      Tags:
+      - Key: Name
+        Value: sg-nat-public-access
+      VpcId:
+        Ref: VpcId
+
+...
